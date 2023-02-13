@@ -1,32 +1,36 @@
-
 import copy
 import os
 import os.path as osp
 import pickle
 import json
 import numpy as np
+from numpy import ndarray
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple
+from tqdm import tqdm
+
 import GPUtil
 import habitat
 import habitat_sim
-import matplotlib.pyplot as plt
 from habitat.utils.geometry_utils import quaternion_from_two_vectors
 from habitat.config.default import get_agent_config, get_config
 from habitat.tasks.utils import compute_pixel_coverage
 from habitat.config.read_write import read_write
 from habitat.config.default_structured_configs import HabitatSimSemanticSensorConfig
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
-from ovon.dataset.hm3d_constants import HM3D_SCENES
-from ovon.dataset.generate_objectnav_dataset import get_scene_key
+from habitat_sim import bindings as hsim
+from habitat_sim._ext.habitat_sim_bindings import SemanticObject, BBox
+from habitat_sim.agent.agent import AgentConfiguration, AgentState
+from habitat_sim.simulator import Simulator
+
+from ovon.dataset.semantic_utils import get_hm3d_semantic_scenes
 from ovon.dataset.pose_sampler import PoseSampler
 from PIL import Image, ImageDraw
-import itertools
-import math
-pi = math.pi
-
 
 SCENES_ROOT = "data/scene_datasets/hm3d"
 NUM_GPUS = len(GPUtil.getAvailable(limit=256))
 TASKS_PER_GPU = 12
+
 
 def create_html(objects, file_name, scene_key):
     html_text = """
@@ -110,94 +114,116 @@ def create_html(objects, file_name, scene_key):
     html_text += """</ul>
                     </body>
                     </html>"""
-    f = open(file_name,"w")
+    f = open(file_name, "w")
     f.write(html_text)
     f.close()
 
 
-def _get_iou_pose(sim, pose, object):
+def is_on_ceiling(sim, aabb: BBox):
+    point = np.asarray(aabb.center)
+    snapped = sim.pathfinder.snap_point(point)
+
+    # The snapped point is on the floor above
+    # It is more than 10 cms above the object centroid
+    if snapped[1] > point[1] + 0.1:
+        return True
+
+    # Snapped point is on the ground
+    if snapped[1] < point[1] - 1.0:
+        return True
+
+    return False
+
+
+def _get_iou_pose(sim: Simulator, pose: AgentState, object: SemanticObject):
     agent = sim.get_agent(0)
-    obs = agent.set_state(pose)
+    agent.set_state(pose)
+    obs = sim.get_sensor_observations()
     cov = compute_pixel_coverage(obs["semantic"], object.semantic_id)
-    if(cov >= maxcov):
-        maxcov = cov
-    
-    return maxcov, pose, "Success"
+    return cov, pose, "Success"
 
 
-def get_best_viewpoint_with_posesampler(sim, object, pose_sampler):
+def get_best_viewpoint_with_posesampler(
+    sim: Simulator, object: SemanticObject, pose_sampler: PoseSampler
+):
     candidate_states = pose_sampler.sample_agent_poses_radially(object)
-    candidate_poses_ious = list(_get_iou_pose(sim, pos,object) for pos in candidate_states)
+    candidate_poses_ious = list(
+        _get_iou_pose(sim, pos, object) for pos in candidate_states
+    )
     candidate_poses_ious_filtered = [p for p in candidate_poses_ious if p[0] > 0]
-    candidate_poses_sorted = sorted(candidate_poses_ious_filtered, key=lambda x: x[0], reverse=True)
-    if candidate_poses_sorted:  
+    candidate_poses_sorted = sorted(
+        candidate_poses_ious_filtered, key=lambda x: x[0], reverse=True
+    )
+    if candidate_poses_sorted:
         return True, candidate_poses_sorted[0]
-    else :
+    else:
         return False, None
 
-def get_bounding_box(obs, object):
+
+def get_bounding_box(obs: List[Dict[str, ndarray]], object: SemanticObject):
     a_args = np.argwhere(obs["semantic"] == (object.semantic_id))
-    try : 
-        bb_a = (np.min(a_args[:,0]), np.max(a_args[:,0]),np.min(a_args[:,1]), np.max(a_args[:,1]))
-        area = (bb_a[1]-bb_a[0])*(bb_a[3] - bb_a[2])
-        return True, bb_a, area/(obs["semantic"].shape[0]*obs["semantic"].shape[1])
-    except ValueError :
+    try:
+        bb_a = (
+            np.min(a_args[:, 0]),
+            np.max(a_args[:, 0]),
+            np.min(a_args[:, 1]),
+            np.max(a_args[:, 1]),
+        )
+        area = (bb_a[1] - bb_a[0]) * (bb_a[3] - bb_a[2])
+        return True, bb_a, area / (obs["semantic"].shape[0] * obs["semantic"].shape[1])
+    except ValueError:
         return False, None, None
 
-def get_objects(sim, objects_info, scene_key, obj_mapping): 
-    f = open('data/obj/filtered_raw_categories.json')
-    FILTERED_CATEGORIES = json.load(f)
-    filtered_objects = [obj for obj in objects_info if obj.category.name() in FILTERED_CATEGORIES]
-    threshold_fractions = [0.05,0.1,0.15,0.20]
-    size_filtered = {}
+
+def get_objects(sim, objects_info, scene_key, obj_mapping, pose_sampler):
     objects_visualized = []
     cnt = 0
+    agent = sim.get_agent(0)
 
+    filtered_objects = [
+        obj for obj in objects_info if obj.category.name() in FILTERED_CATEGORIES
+    ]
     if not osp.isdir(f"data/images/objects/{scene_key}"):
-        os.makedir(f"data/images/objects/{scene_key}")
+        os.mkdir(f"data/images/objects/{scene_key}")
 
-    pose_sampler = PoseSampler(
-        sim=sim,
-        r_min=0.5,
-        r_max=2.0,
-        r_step=0.5,
-        rot_deg_delta=10.0,
-        h_min=0.8,
-        h_max=1.4,
-        sample_lookat_deg_delta=5.0,
-    )
+    for object in filtered_objects:
+        name = object.category.name().replace("/", " ")
+        if is_on_ceiling(sim, object.aabb):
+            print(f"Object : {name} is on the ceiling!")
+            continue
 
-    for object in filtered_objects :
-        name = object.category.name()        
         check, view = get_best_viewpoint_with_posesampler(sim, object, pose_sampler)
-        if check: 
-            cov, pt, q, angle, _ = view
-            obs = set_agent_state(sim,pt,q, angle)
-            bb_check, bb, fraction = get_bounding_box(obs,object)
-            if bb_check and (name not in obj_mapping or scene_key not in obj_mapping[name] or cov > obj_mapping[name][scene_key]):
+        if check:
+            cov, pose, _ = view
+            agent.set_state(pose)
+            obs = sim.get_sensor_observations()
+            bb_check, bb, fraction = get_bounding_box(obs, object)
+            if bb_check and (
+                name not in obj_mapping
+                or scene_key not in obj_mapping[name]
+                or cov > obj_mapping[name][scene_key][0]
+            ):
+                # Add object visualization to mapping
+                if name not in obj_mapping.keys():
+                    obj_mapping[name] = {}
+                obj_mapping[name][scene_key] = (cov, fraction)
 
-                for f in threshold_fractions:
-                    if(fraction < f):
-                        size_filtered[f]+=1
-
-
-
-                #Add object visualization to mapping
-                obj_mapping[name][scene_key] = cov
-
-                #Draw bounding box and save image
-                i=Image.fromarray(obs["rgb"][:,:,:3], 'RGB')
-                draw=ImageDraw.Draw(i)
-                draw.rectangle([(bb[3],bb[1]),(bb[2],bb[0])],outline="red", width = 3)
+                # Draw bounding box and save image
+                i = Image.fromarray(obs["rgb"][:, :, :3], "RGB")
+                draw = ImageDraw.Draw(i)
+                draw.rectangle([(bb[3], bb[1]), (bb[2], bb[0])], outline="red", width=3)
                 i.save(f"data/images/objects/{scene_key}/{name}.png")
 
                 objects_visualized.append(object.category.name().strip())
-                cnt+=1
+                cnt += 1
 
-        else :
+        else:
             print("No viewpoint for object :", name)
-    print(f"Visualised {cnt} number of objects for scene {scene_key} out of total {len(filtered_objects)}!")
-    #create_html(objects_visualized, f"data/webpage/{scene_key}/objects.html", scene_key)
+    print(
+        f"Visualised {cnt} number of objects for scene {scene_key} out of total {len(filtered_objects)}!"
+    )
+    # create_html(objects_visualized, f"data/webpage/{scene_key}/objects.html", scene_key)
+
 
 def get_objnav_config(i, scene):
     CFG = "habitat-lab/habitat-lab/habitat/config/benchmark/nav/objectnav/objectnav_hm3d.yaml"
@@ -207,7 +233,7 @@ def get_objnav_config(i, scene):
     with read_write(objnav_config):
         agent_config = get_agent_config(objnav_config.habitat.simulator)
 
-        #Stretch agent
+        # Stretch agent
         agent_config.height = 1.41
         agent_config.radius = 0.17
 
@@ -232,7 +258,7 @@ def get_objnav_config(i, scene):
         else:
             deviceId = deviceIds[0]
         objnav_config.habitat.simulator.habitat_sim_v0.gpu_device_id = (
-            deviceId  # i % NUM_GPUS 
+            deviceId  # i % NUM_GPUS
         )
         objnav_config.habitat.dataset.scenes_dir = "./data/scene_datasets/"
         objnav_config.habitat.dataset.split = "train"
@@ -255,19 +281,44 @@ def get_simulator(objnav_config):
     return sim
 
 
+def generate_webpage(sorted_obj_mapping):
+    for obj in sorted_obj_mapping.keys():
+        pass
+
+
 def main():
-    object_map = {} #map between object instance -> (coverage, scene)
-                    #sort for each object and generate 4-5 visualisation
-    for i,glb_path in enumerate(HM3D_SCENES['train'][:5]):
-        scene_key  = get_scene_key(glb_path)
-        print(f"Starting scene: {scene_key}")
-        cfg = get_objnav_config(i,scene_key)
+    object_map = {}  # map between object instance -> (coverage, scene)
+    # sort for each object and generate 4-5 visualisation
+    HM3D_SCENES = get_hm3d_semantic_scenes("data/scene_datasets/hm3d")
+    print(HM3D_SCENES["train"])
+    for i, scene in tqdm(enumerate(list(HM3D_SCENES["train"])[:5])):
+        scene_key = os.path.basename(scene).split(".")[0]
+        cfg = get_objnav_config(i, scene_key)
         sim = get_simulator(cfg)
         objects_info = sim.semantic_scene.objects
-        get_objects(sim, objects_info, scene_key, object_map)
-        print(object_map.keys())
-        print(object_map['chair'].keys())
+        pose_sampler = PoseSampler(
+            sim=sim,
+            r_min=0.5,
+            r_max=2.0,
+            r_step=0.5,
+            rot_deg_delta=10.0,
+            h_min=0.8,
+            h_max=1.4,
+            sample_lookat_deg_delta=5.0,
+        )
+        print(f"Starting scene: {scene_key}")
+        get_objects(sim, objects_info, scene_key, object_map, pose_sampler)
         sim.close()
 
+    sorted_object_mapping = {}
+    print(f"Total number of objects visualized is {len(object_map.keys())}")
+    for obj in object_map.keys():
+        for scene, (cov, fraction) in object_map[obj].items():
+            sorted_object_mapping[obj].append((cov, fraction, scene))
+        sorted(sorted_object_mapping[obj], reverse=True)
+
+
 if __name__ == "__main__":
+    f = open("data/obj/filtered_raw_categories.json")
+    FILTERED_CATEGORIES = json.load(f)
     main()
