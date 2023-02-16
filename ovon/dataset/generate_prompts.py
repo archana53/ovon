@@ -1,22 +1,28 @@
-
-import copy
-import os
-import pickle
-import json
-import numpy as np
-import habitat_sim
-import matplotlib.pyplot as plt
-from habitat.utils.geometry_utils import quaternion_from_two_vectors
-from habitat.tasks.utils import compute_pixel_coverage
-from PIL import Image, ImageDraw
+import argparse
 import itertools
-import imageio
+import json
+import os
+import os.path as osp
+import pickle
 
-def _direction_to_quaternion(direction_vector: np.array):
-    origin_vector = np.array([0, 0, -1])
-    output = quaternion_from_two_vectors(origin_vector, direction_vector)
-    output = output.normalized()
-    return output
+import matplotlib.pyplot as plt
+import numpy as np
+from habitat.tasks.utils import compute_pixel_coverage
+from habitat.utils.geometry_utils import quaternion_from_two_vectors
+from ovon.dataset.pose_sampler import PoseSampler
+from ovon.dataset.semantic_utils import get_hm3d_semantic_scenes
+from ovon.dataset.visualise_objects import (
+    get_best_viewpoint_with_posesampler,
+    get_bounding_box,
+    get_objnav_config,
+    get_simulator,
+)
+from PIL import Image, ImageDraw
+from torchvision.ops import masks_to_boxes
+from torchvision.transforms import PILToTensor, ToPILImage
+from torchvision.utils import draw_bounding_boxes
+from tqdm import tqdm
+
 
 def create_html(relationships, file_name):
     html_text = """
@@ -100,9 +106,12 @@ def create_html(relationships, file_name):
     html_text += """</ul>
                     </body>
                     </html>"""
-    f = open(file_name,"w")
+    f = open(file_name, "w")
     f.write(html_text)
     f.close()
+
+
+"""
 
 def set_agent_state(pt, q):
     agent_state = agent.get_state()
@@ -112,17 +121,18 @@ def set_agent_state(pt, q):
     obs = sim.get_sensor_observations()
     return obs
 
+
 def get_best_viewpoint(sim, pt, id1, id2):
     "Returns the best viewpoint of objects of id1 and id2"
     pf = sim.pathfinder
-    x_coords = np.linspace(pt[0]-1.5,pt[0]+1.5,20)
-    z_coords = np.linspace(pt[2]-1.5,pt[2]+1.5,20)
+    x_coords = np.linspace(pt[0] - 1.5, pt[0] + 1.5, 20)
+    z_coords = np.linspace(pt[2] - 1.5, pt[2] + 1.5, 20)
     y = pt[1]
     maxcov = 0
-    for x,z in list(itertools.product(x_coords,z_coords)):
+    for x, z in list(itertools.product(x_coords, z_coords)):
         cov = 0
-        pt_new = pf.snap_point([x,y,z])
-        goal_direction = pt - pt_new 
+        pt_new = pf.snap_point([x, y, z])
+        goal_direction = pt - pt_new
         goal_direction[1] = 0
         q = _direction_to_quaternion(goal_direction)
         obs = set_agent_state(pt_new, q)
@@ -133,192 +143,284 @@ def get_best_viewpoint(sim, pt, id1, id2):
             maxcov = cov
     return maxcov, best_obs
 
+
 def get_bounding_box(obs, obj_a, obj_b):
     a_args = np.argwhere(obs["semantic"] == (obj_a.semantic_id))
     b_args = np.argwhere(obs["semantic"] == (obj_b.semantic_id))
-    if(a_args.shape[0] < 150 or b_args.shape[0] <150):
-        print(obj_a.category.name(),a_args.shape[0] , obj_b.category.name(),b_args.shape[0])
-        return False, None , None
-    try : 
-        bb_a = (np.min(a_args[:,0]), np.max(a_args[:,0]),np.min(a_args[:,1]), np.max(a_args[:,1]))
-        try : 
-            bb_b = (np.min(b_args[:,0]), np.max(b_args[:,0]),np.min(b_args[:,1]), np.max(b_args[:,1]))
-            return True, bb_a,bb_b
-        except ValueError :
+    if a_args.shape[0] < 150 or b_args.shape[0] < 150:
+        print(
+            obj_a.category.name(),
+            a_args.shape[0],
+            obj_b.category.name(),
+            b_args.shape[0],
+        )
+        return False, None, None
+    try:
+        bb_a = (
+            np.min(a_args[:, 0]),
+            np.max(a_args[:, 0]),
+            np.min(a_args[:, 1]),
+            np.max(a_args[:, 1]),
+        )
+        try:
+            bb_b = (
+                np.min(b_args[:, 0]),
+                np.max(b_args[:, 0]),
+                np.min(b_args[:, 1]),
+                np.max(b_args[:, 1]),
+            )
+            return True, bb_a, bb_b
+        except ValueError:
             return False, None, None
-    except ValueError :
-        return False, None , None
+    except ValueError:
+        return False, None, None
+
 
 def confirm_orientation(sim, obj_a, obj_b, reln_prompt, direction):
     pf = sim.pathfinder
-    center = (obj_a.aabb.center + obj_b.aabb.center)/2
+    center = (obj_a.aabb.center + obj_b.aabb.center) / 2
     pt = pf.snap_point()
 
 
 def visualize_relationship(sim, obj_a, obj_b, reln_prompt):
-    #Find location best location to view both obj_a and obj_b 
-    objs_center = (obj_a.aabb.center + obj_b.aabb.center)/2
-    cov, obs =  get_best_viewpoint(sim, objs_center, obj_a.semantic_id, obj_b.semantic_id)
-    #Donot visualize if objects are too small to notice
-    i=Image.fromarray(obs["color"][:,:,:3], 'RGB')
-    draw=ImageDraw.Draw(i)
-    check , bb_a, bb_b = get_bounding_box(obs, obj_a, obj_b)
-    if(check):
-        draw.rectangle([(bb_a[3],bb_a[1]),(bb_a[2],bb_a[0])],outline="red", width = 5)
-        draw.rectangle([(bb_b[3],bb_b[1]),(bb_b[2],bb_b[0])],outline="red", width = 5)
+    # Find location best location to view both obj_a and obj_b
+    objs_center = (obj_a.aabb.center + obj_b.aabb.center) / 2
+    cov, obs = get_best_viewpoint(
+        sim, objs_center, obj_a.semantic_id, obj_b.semantic_id
+    )
+    # Donot visualize if objects are too small to notice
+    i = Image.fromarray(obs["color"][:, :, :3], "RGB")
+    draw = ImageDraw.Draw(i)
+    check, bb_a, bb_b = get_bounding_box(obs, obj_a, obj_b)
+    if check:
+        draw.rectangle([(bb_a[3], bb_a[1]), (bb_a[2], bb_a[0])], outline="red", width=5)
+        draw.rectangle([(bb_b[3], bb_b[1]), (bb_b[2], bb_b[0])], outline="red", width=5)
         i.save(f"data/images/relationships/relationship_{reln_prompt}.png")
-    else :
+    else:
         print(reln_prompt)
     return check
 
 
-class Relationships:
+def a_leftto_b(self, a, b, dx=0.05, delta=0.1):
+    # Objects are close by in x/z axis distance
+    distance_x = (b.aabb.center[0] - b.aabb.sizes[0] / 2) - (
+        a.aabb.center[0] + a.aabb.sizes[0] / 2
+    )
+    # distance_z = (b.aabb.center[2] - b.aabb.sizes[2]/2) - (a.aabb.center[2] + a.aabb.sizes[2]/2)
+    total_dist = np.linalg.norm(a.aabb.center - b.aabb.center)
+    if (distance_x <= dx and distance_x >= 0) and total_dist <= delta:
+        return (True, f"{a.category.name()} left of {b.category.name()}")
+
+    return (False, "")
 
 
-    def a_leftto_b(self,a,b,dx = .05, delta=0.1):
-        #Objects are close by in x/z axis distance
-        distance_x = (b.aabb.center[0] - b.aabb.sizes[0]/2) - (a.aabb.center[0] + a.aabb.sizes[0]/2)
-        #distance_z = (b.aabb.center[2] - b.aabb.sizes[2]/2) - (a.aabb.center[2] + a.aabb.sizes[2]/2)
-        total_dist = (np.linalg.norm(a.aabb.center - b.aabb.center))
-        if(distance_x <= dx and distance_x >= 0) and total_dist <= delta :
-            return (True, f"{a.category.name()} left of {b.category.name()}")
+def a_rightto_b(self, a, b, dx=0.05, delta=0.1):
+    # Objects are close by in x/z axis distance
+    distance_x = (a.aabb.center[0] - a.aabb.sizes[0] / 2) - (
+        b.aabb.center[0] + b.aabb.sizes[0] / 2
+    )
+    # distance_z = (a.aabb.center[2] - a.aabb.sizes[2]/2) - (b.aabb.center[2] + b.aabb.sizes[2]/2)
+    total_dist = np.linalg.norm(a.aabb.center - b.aabb.center)
+    if (distance_x <= dx and distance_x >= 0) and total_dist <= delta:
+        return (True, f"{a.category.name()} right of {b.category.name()}")
 
-        return(False, "")
-    def a_rightto_b(self,a,b,dx = 0.05, delta = 0.1):
-        #Objects are close by in x/z axis distance
-        distance_x = (a.aabb.center[0] - a.aabb.sizes[0]/2) - (b.aabb.center[0] + b.aabb.sizes[0]/2)
-        #distance_z = (a.aabb.center[2] - a.aabb.sizes[2]/2) - (b.aabb.center[2] + b.aabb.sizes[2]/2)
-        total_dist = (np.linalg.norm(a.aabb.center - b.aabb.center))
-        if(distance_x <= dx and distance_x >= 0)  and total_dist <= delta :
-            return (True, f"{a.category.name()} right of {b.category.name()}")
-
-        return(False, "")
-    
+    return (False, "")
 
 
-    def a_above_b(self,a,b,dy = 0.05, delta= 0.1):
-        #a should be bigger than b
-        distance_y = (a.aabb.center[1] - a.aabb.sizes[1]/2) - (b.aabb.center[1] + b.aabb.sizes[1]/2)
-        total_dist = (np.linalg.norm(a.aabb.center - b.aabb.center))
-        if( distance_y <= dy and distance_y >= 0 and total_dist <= delta) :
-            return (True, f"{a.category.name()} above {b.category.name()}")
+def a_above_b(self, a, b, dy=0.05, delta=0.1):
+    # a should be bigger than b
+    distance_y = (a.aabb.center[1] - a.aabb.sizes[1] / 2) - (
+        b.aabb.center[1] + b.aabb.sizes[1] / 2
+    )
+    total_dist = np.linalg.norm(a.aabb.center - b.aabb.center)
+    if distance_y <= dy and distance_y >= 0 and total_dist <= delta:
+        return (True, f"{a.category.name()} above {b.category.name()}")
 
-        return(False, "")
+    return (False, "")
 
-    def a_below_b(self,a,b, dy= 0.1, delta = 0.2):
-        #Center of a should lie in x and z axis bounds of b 
-        #Center of a_y should be lesser then b_y by a margin
-        #a should be bigger than b
-        
-        distance_y = (b.aabb.center[1] - b.aabb.sizes[1]/2) - (a.aabb.center[1] + a.aabb.sizes[1]/2)
-        total_dist = (np.linalg.norm(a.aabb.center - b.aabb.center))
-        if((distance_y <= dy  and distance_y) >= 0 and total_dist <= delta) :
-            return (True, f"{a.category.name()} below {b.category.name()}")
 
-        return(False, "")
+def a_below_b(self, a, b, dy=0.1, delta=0.2):
+    # Center of a should lie in x and z axis bounds of b
+    # Center of a_y should be lesser then b_y by a margin
+    # a should be bigger than b
 
-    def a_near_b(a,b,delta = .1):
-        if(np.linalg.norm(a.aabb.center-b.aabb.center) <= delta):
-            return (True, f"{a.category.name()} near {b.category.name()}")
-        else :
-            return (False, "")
+    distance_y = (b.aabb.center[1] - b.aabb.sizes[1] / 2) - (
+        a.aabb.center[1] + a.aabb.sizes[1] / 2
+    )
+    total_dist = np.linalg.norm(a.aabb.center - b.aabb.center)
+    if (distance_y <= dy and distance_y) >= 0 and total_dist <= delta:
+        return (True, f"{a.category.name()} below {b.category.name()}")
 
-    def a_inside_b(a,b):
-        a1 = a.aabb.center - a.aabb.sizes/2
-        a2 = a.aabb.center + a.aabb.sizes/2
+    return (False, "")
 
-        b1 = b.aabb.center - b.aabb.sizes/2
-        b2 = b.aabb.center + b.aabb.sizes/2
-        check = True
-        for i in range(len(a.aabb.center)):
-            if(a1[i] < b1[i] or a2[i] > b2[i]):
-                check = False
-        if(check) :
-            return (True, f"{a.category.name()} inside {b.category.name()}")
-        else :
-            return (False, "")
+"""
 
-def get_relationships_from3d(sim, objects,d =0.1, delta = .5):
-    f = open('data/obj/filtered_raw_categories.json')
-    relations = ["above","below" ,"leftto", "rightto"]
-    functions = Relationships()
+
+def a_near_b(a, b, delta=0.5):
+    if np.linalg.norm(a.aabb.center - b.aabb.center) <= delta:
+        return (True, f"{a.category.name()} near {b.category.name()}")
+    else:
+        return (False, "")
+
+
+"""
+
+def a_inside_b(a, b):
+    a1 = a.aabb.center - a.aabb.sizes / 2
+    a2 = a.aabb.center + a.aabb.sizes / 2
+
+    b1 = b.aabb.center - b.aabb.sizes / 2
+    b2 = b.aabb.center + b.aabb.sizes / 2
+    check = True
+    for i in range(len(a.aabb.center)):
+        if a1[i] < b1[i] or a2[i] > b2[i]:
+            check = False
+    if check:
+        return (True, f"{a.category.name()} inside {b.category.name()}")
+    else:
+        return (False, "")
+
+
+
+def get_relationships_from3d(sim, objects, d=0.1, delta=0.5):
+    f = open("data/obj/filtered_raw_categories.json")
+    relations = ["above", "below", "leftto", "rightto"]
     FILTERED_CATEGORIES = json.load(f)
-    filtered_objects = [obj for obj in objects if obj.category.name() in FILTERED_CATEGORIES]
+    filtered_objects = [
+        obj for obj in objects if obj.category.name() in FILTERED_CATEGORIES
+    ]
     mapping = {}
     obj_relationships = []
-    for a in filtered_objects :
-        mapping[a.category.name()] = {"leftto" : [] , "rightto" : [], "above" : [] , "below" : []}
-        for b in filtered_objects :
-            if(a.category.name() != b.category.name()):
-                for r in relations :
-                    func = getattr(functions,"a_" + r + "_b")
-                    val, prompt = func(a,b,d,delta)
-                    if(val == True and not(np.array_equal(a.aabb.center,b.aabb.center))):
+    for a in filtered_objects:
+        mapping[a.category.name()] = {
+            "leftto": [],
+            "rightto": [],
+            "above": [],
+            "below": [],
+        }
+        for b in filtered_objects:
+            if a.category.name() != b.category.name():
+                for r in relations:
+                    func = getattr(functions, "a_" + r + "_b")
+                    val, prompt = func(a, b, d, delta)
+                    if val == True and not (
+                        np.array_equal(a.aabb.center, b.aabb.center)
+                    ):
                         mapping[a.category.name()][r].append(b.category.name())
-                        if(visualize_relationship(sim, a,b,prompt)):
+                        if visualize_relationship(sim, a, b, prompt):
                             obj_relationships.append(prompt)
                             mapping[a.category.name()][r].append(b.category.name())
 
-    create_html(obj_relationships, "data/webpage/relationships_3d.html")    
+    create_html(obj_relationships, "data/webpage/relationships_3d.html")
 
-def get_relation_2d(sim,a,b):
-    #Generate different viewpoints for a,b by using points around the center of bounding box
-    #Ensure semantic sensor has both of them
-    #Create bounding boxes for these two objects and find out relationship
-    pass
+"""
 
-def get_relationships_from2d(sim, objects,d =0.1, delta = .5):
-    f = open('data/obj/filtered_raw_categories.json')
-    functions = Relationships()
-    FILTERED_CATEGORIES = json.load(f)
-    filtered_objects = [obj for obj in objects if obj.category.name() in FILTERED_CATEGORIES]
-    mapping = {}
+
+def get_relation_2d(sim, pose_sampler, a, b, mapping):
+    agent = sim.get_agent(0)
+    check, view = get_best_viewpoint_with_posesampler(sim, pose_sampler, a, b)
+    name_b = b.category.name()
+    name_a = a.category.name()
+    if check:
+        cov, pose, _ = view
+        agent.set_state(pose)
+        obs = sim.get_sensor_observations()
+        bb_check, bb, fraction = get_bounding_box(obs, a, b)
+        if bb_check and fraction > 0:
+            center1 = np.array([(bb[0][0] + bb[0][2]) / 2, (bb[0][1] + bb[0][3]) / 2])
+            center2 = np.array([(bb[1][0] + bb[1][2]) / 2, (bb[1][1] + bb[1][3]) / 2])
+            x_disp, y_disp = center2 - center1
+            if abs(x_disp) > abs(y_disp):  # left/right/near relationship
+                if x_disp > 0:
+                    rel = f"{name_b} near (right) {name_a}"
+                else:
+                    rel = f"{name_b} near (left) {name_a}"
+            else:  # above/below relationship
+                if y_disp > 0:
+                    rel = f"{name_b} below {name_a}"
+                else:
+                    rel = f"{name_b} above {name_a}"
+            img = Image.fromarray(obs["rgb"][:, :, :3], "RGB")
+            drawn_boxes = draw_bounding_boxes(
+                PILToTensor()(img), bb, colors="red", width=3
+            )
+            return True, rel, drawn_boxes
+    return False, None, None
+
+
+def get_relationships_from2d(sim, objects, scene_key, pose_sampler, mapping):
+    filtered_objects = [
+        obj for obj in objects if obj.category.name() in FILTERED_CATEGORIES
+    ]
+    if not osp.isdir(f"data/images/relationships_2d/{scene_key}"):
+        os.mkdir(f"data/images/relationships_2d/{scene_key}")
     obj_relationships = []
-    for a in filtered_objects :
-        for b in filtered_objects :
-            if(a.category.name() != b.category.name() and functions.a_near_b(a,b)[1]):
-                check, prompt = get_relation_2d(a,b)
-                if(check):
-                    obj_relationships.append(prompt)
-    create_html(obj_relationships, "data/webpage/relationships_2d.html")           
+    for a in filtered_objects:
+        for b in filtered_objects:
+            name_a = a.category.name()
+            name_b = b.category.name()
+            volume_a = np.prod((a.aabb.sizes))
+            volume_b = np.prod((b.aabb.sizes))
+            if name_a != name_b and volume_a > volume_b and a_near_b(a, b)[0]:
+                print(
+                    f"Finding relation between {a.category.name()}  and {b.category.name()}"
+                )
+                check, rel, img = get_relation_2d(sim, pose_sampler, a, b, mapping)
+                if check:
+                    print(rel)
+                    (ToPILImage()(img)).convert("RGB").save(
+                        f"data/images/relationships_2d/{scene_key}/{rel}.png"
+                    )
 
-#def get_object_data(scene_path = "data/scene_datasets/hm3d/minival/00800-TEEsavR23oF/TEEsavR23oF.basis.glb" ):
-scene_path = "data/scene_datasets/hm3d/minival/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
-scene_key = "TEEsavR23oF"
-fname_obj = f"data/obj/{scene_key}_objs.pkl"
-if os.path.exists(fname_obj):
-    with open(fname_obj, "rb") as f:
-        objects_info = pickle.load(f)
-    
-else:
-    backend_cfg = habitat_sim.SimulatorConfiguration()
-    backend_cfg.scene_id = (
-        scene_path
+    # create_html(obj_relationships, "data/webpage/relationships_2d.html")
+
+
+def main():
+    relationship_map = (
+        {}
+    )  # map between scene -> relationship -> obja -> objb -> coverage
+    # sort for each object and generate 4-5 visualisation
+    HM3D_SCENES = get_hm3d_semantic_scenes("data/scene_datasets/hm3d")
+    for i, scene in tqdm(enumerate(list(HM3D_SCENES[split]))):
+        scene_key = os.path.basename(scene).split(".")[0]
+        cfg = get_objnav_config(i, scene_key)
+        sim = get_simulator(cfg)
+        objects_info = sim.semantic_scene.objects
+        pose_sampler = PoseSampler(
+            sim=sim,
+            r_min=0.1,
+            r_max=2.0,
+            r_step=0.25,
+            rot_deg_delta=10.0,
+            h_min=0.8,
+            h_max=1.4,
+            sample_lookat_deg_delta=5.0,
+        )
+        print(f"Starting scene: {scene_key}")
+        get_relationships_from2d(
+            sim, objects_info, scene_key, pose_sampler, relationship_map
+        )
+        sim.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-s",
+        "--split",
+        help="split of data to be used",
+        type=str,
+        required=True,
     )
-    backend_cfg.scene_dataset_config_file = (
-        "data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
+    parser.add_argument(
+        "-f",
+        "--filtered_data",
+        help="path of json which contains the filtered categories",
+        type=str,
+        required=True,
     )
-
-    rgb_cfg = habitat_sim.CameraSensorSpec()
-    rgb_cfg.uuid = "color"
-    rgb_cfg.resolution = [1024, 1024]
-    rgb_cfg.sensor_type = habitat_sim.SensorType.COLOR
-
-    sem_cfg = habitat_sim.CameraSensorSpec()
-    sem_cfg.uuid = "semantic"
-    sem_cfg.resolution =[1024, 1024]
-    sem_cfg.sensor_type = habitat_sim.SensorType.SEMANTIC
-
-    agent_cfg = habitat_sim.agent.AgentConfiguration()
-    agent_cfg.sensor_specifications = [rgb_cfg, sem_cfg]
-
-    sim_cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
-    sim = habitat_sim.Simulator(sim_cfg)
-    agent = sim.initialize_agent(0) 
-
-    navmesh_settings = habitat_sim.NavMeshSettings()
-    navmesh_settings.set_defaults()
-    sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
-    objects_info = sim.semantic_scene.objects
-get_relationships_from2d(sim, objects_info)
-sim.close()
+    args = parser.parse_args()
+    split = args.split
+    f = open(args.filtered_data)
+    FILTERED_CATEGORIES = json.load(f)
+    main()

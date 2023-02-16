@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import habitat_sim
 import numpy as np
@@ -12,7 +12,6 @@ EPS_ARRAY = np.array([1e-5, 0.0, 1e-5])
 
 
 class PoseSampler:
-
     sim: Simulator
     radius_min: float
     radius_max: float
@@ -86,14 +85,19 @@ class PoseSampler:
 
         return snapped, valid
 
-    def sample_agent_poses_radially(self, obj: SemanticObject) -> List[AgentState]:
+    def sample_agent_poses_radially(
+        self,
+        obj: Union[None, SemanticObject] = None,
+        search_center: Union[None, np.ndarray] = None,
+    ) -> List[AgentState]:
         """Generates AgentState.position and AgentState.rotation for all
         navigable agent poses given a radial sampling method about the
         centroid of an object.
         """
-        floor_height = self._get_floor_height(obj.aabb)
-        obj_loc = obj.aabb.center
-        search_center = np.array([obj_loc[0], floor_height, obj_loc[2]])
+        if not isinstance(search_center, np.ndarray):
+            floor_height = self._get_floor_height(obj.aabb)
+            obj_loc = obj.aabb.center
+            search_center = np.array([obj_loc[0], floor_height, obj_loc[2]])
 
         poses: List[AgentState] = []
 
