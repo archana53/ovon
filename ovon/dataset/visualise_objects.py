@@ -9,21 +9,17 @@ import GPUtil
 import habitat
 import habitat_sim
 import numpy as np
-import torch
 from habitat.config.default import get_agent_config, get_config
 from habitat.config.default_structured_configs import HabitatSimSemanticSensorConfig
 from habitat.config.read_write import read_write
-from habitat.tasks.utils import compute_pixel_coverage
-from habitat_sim._ext.habitat_sim_bindings import BBox, SemanticObject
-from habitat_sim.agent.agent import AgentState
-from habitat_sim.simulator import Simulator
-from numpy import ndarray
+from habitat_sim._ext.habitat_sim_bindings import BBox
 from ovon.dataset.pose_sampler import PoseSampler
 from ovon.dataset.semantic_utils import get_hm3d_semantic_scenes
-from PIL import Image
-from torchvision.ops import masks_to_boxes
-from torchvision.transforms import PILToTensor, ToPILImage
-from torchvision.utils import draw_bounding_boxes
+from ovon.dataset.visualization import (
+    get_best_viewpoint_with_posesampler,
+    get_bounding_box,
+)
+from torchvision.transforms import ToPILImage
 from tqdm import tqdm
 
 SCENES_ROOT = "data/scene_datasets/hm3d"
@@ -36,7 +32,7 @@ def create_html(file_name, objects_mapping, visualised=True, threshold=0.05):
     <html>
     <head>
         <meta charset="utf-8">
-        <title>Objects Spatial Relationships</title>
+        <title>Objects Visualisation</title>
     </head>"""
     html_style = """
     <style>
@@ -57,13 +53,45 @@ def create_html(file_name, objects_mapping, visualised=True, threshold=0.05):
         }
     </style>
     """
+    html_script = """
+    <script>
+    var li_categories = []
+
+    const download0 = () => (
+        encodeURIComponent(
+            JSON.stringify(
+            localStorage.getItem('categories')
+            ),
+            null,
+            2
+            )
+    )
+
+    function addObjectToCategories(cb) {
+    if (cb.checked) {
+        li_categories.push(cb.id);
+    }
+    else {
+        var index = li_categories.indexOf(cb.id);
+        if (index > -1) {
+            li_categories.splice(index, 1);
+        }
+    }
+
+    console.log(li_categories)
+    localStorage.setItem("categories",li_categories)
+    download0()
+    
+    }
+    </script>
+    """
     cnt = 0
     html_body = ""
     for obj in objects_mapping.keys():
         # Visualized Objects
         if visualised and objects_mapping[obj][0][1] >= threshold:
             cnt += 1
-            html_body += f"""<h3>{obj}</h3> 
+            html_body += f"""<h3>{obj}</h3><input name="checkbox" onclick="addObjectToCategories(this);" type="checkbox" id="{obj}" />
                             <div class="row">
                             """
             for cov, frac, scene in objects_mapping[obj][:5]:
@@ -98,7 +126,7 @@ def create_html(file_name, objects_mapping, visualised=True, threshold=0.05):
     html_body += """</body>
                     </html>"""
     f = open(file_name, "w")
-    f.write(html_head + html_style + html_body)
+    f.write(html_head + html_style + html_script + html_body)
     f.close()
 
 
@@ -115,74 +143,6 @@ def is_on_ceiling(sim, aabb: BBox):
     if snapped[1] < point[1] - 1.5:
         return True
     return False
-
-
-def _get_iou_pose(
-    sim: Simulator, pose: AgentState, object1: SemanticObject, object2: SemanticObject
-):
-    agent = sim.get_agent(0)
-    agent.set_state(pose)
-    obs = sim.get_sensor_observations()
-    cov1 = compute_pixel_coverage(obs["semantic"], object1.semantic_id)
-    if object2 != None:
-        cov2 = compute_pixel_coverage(obs["semantic"], object2.semantic_id)
-        if cov1 > 0 and cov2 > 0:
-            return cov1 + cov2, pose, "Success"
-    else:
-        return cov1, pose, "Success"
-    return 0, pose, "Failure"
-
-
-def get_best_viewpoint_with_posesampler(
-    sim: Simulator,
-    pose_sampler: PoseSampler,
-    object1: SemanticObject,
-    object2: Union[SemanticObject, None] = None,
-):
-    if isinstance(object2, SemanticObject):
-        center = np.array((object1.aabb.center + object2.aabb.center) / 2)
-        candidate_states = pose_sampler.sample_agent_poses_radially(
-            search_center=center
-        )
-    else:
-        candidate_states = pose_sampler.sample_agent_poses_radially(obj=object1)
-    candidate_poses_ious = list(
-        _get_iou_pose(sim, pos, object1, object2) for pos in candidate_states
-    )
-    candidate_poses_ious_filtered = [p for p in candidate_poses_ious if p[0] > 0]
-    candidate_poses_sorted = sorted(
-        candidate_poses_ious_filtered, key=lambda x: x[0], reverse=True
-    )
-    if candidate_poses_sorted:
-        return True, candidate_poses_sorted[0]
-    else:
-        return False, None
-
-
-def get_bounding_box(
-    obs: List[Dict[str, ndarray]],
-    object1: SemanticObject,
-    object2: Union[SemanticObject, None] = None,
-):
-    H, W = obs["semantic"].shape[0], obs["semantic"].shape[1]
-    masks = (obs["semantic"] == np.array([[(object1.semantic_id)]])).reshape((1, H, W))
-    if object2:
-        mask2 = (obs["semantic"] == np.array([[(object2.semantic_id)]])).reshape(
-            (1, H, W)
-        )
-        masks = np.concatenate((masks, mask2), axis=0)
-    try:
-        boxes = masks_to_boxes(torch.from_numpy(masks))
-        area = (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])
-        if object2:
-            area += (boxes[1][2] - boxes[1][0]) * (boxes[1][3] - boxes[1][1])
-        return (
-            True,
-            boxes,
-            area / (H * W) * 1.00,
-        )
-    except ValueError:
-        return False, None, None
 
 
 def get_objects(sim, objects_info, scene_key, obj_mapping, pose_sampler):
@@ -206,27 +166,18 @@ def get_objects(sim, objects_info, scene_key, obj_mapping, pose_sampler):
             cov, pose, _ = view
             agent.set_state(pose)
             obs = sim.get_sensor_observations()
-            bb_check, bb, fraction = get_bounding_box(obs, object)
-            if (
-                bb_check
-                and fraction > 0
-                and (
-                    name not in obj_mapping
-                    or scene_key not in obj_mapping[name]
-                    or cov > obj_mapping[name][scene_key][0]
-                )
+            drawn_img, fraction = get_bounding_box(obs, object)
+            if fraction > 0 and (
+                name not in obj_mapping
+                or scene_key not in obj_mapping[name]
+                or cov > obj_mapping[name][scene_key][0]
             ):
                 # Add object visualization to mapping
                 if name not in obj_mapping.keys():
                     obj_mapping[name] = {}
-                obj_mapping[name][scene_key] = (cov, fraction)
+                obj_mapping[name][scene_key] = (np.sum(cov), fraction)
 
-                # Draw bounding box and save image
-                img = Image.fromarray(obs["rgb"][:, :, :3], "RGB")
-                drawn_boxes = draw_bounding_boxes(
-                    PILToTensor()(img), bb, colors="red", width=3
-                )
-                (ToPILImage()(drawn_boxes)).convert("RGB").save(
+                (ToPILImage()(drawn_img)).convert("RGB").save(
                     f"data/images/objects/{scene_key}/{name}.png"
                 )
                 objects_visualized.append(object.category.name().strip())
@@ -297,37 +248,43 @@ def get_simulator(objnav_config):
 
 
 def main():
-    object_map = {}  # map between object instance -> (coverage, scene)
-    # sort for each object and generate 4-5 visualisation
-    HM3D_SCENES = get_hm3d_semantic_scenes("data/scene_datasets/hm3d")
-    for i, scene in tqdm(enumerate(list(HM3D_SCENES[split]))):
-        scene_key = os.path.basename(scene).split(".")[0]
-        cfg = get_objnav_config(i, scene_key)
-        sim = get_simulator(cfg)
-        objects_info = sim.semantic_scene.objects
-        pose_sampler = PoseSampler(
-            sim=sim,
-            r_min=0.5,
-            r_max=2.0,
-            r_step=0.5,
-            rot_deg_delta=10.0,
-            h_min=0.8,
-            h_max=1.4,
-            sample_lookat_deg_delta=5.0,
-        )
-        print(f"Starting scene: {scene_key}")
-        get_objects(sim, objects_info, scene_key, object_map, pose_sampler)
-        sim.close()
+    if not os.path.isfile(f"data/object_images_{split}.pickle"):
+        object_map = {}  # map between object instance -> (coverage, scene)
+        # sort for each object and generate 4-5 visualisation
+        HM3D_SCENES = get_hm3d_semantic_scenes("data/scene_datasets/hm3d")
+        for i, scene in tqdm(enumerate(list(HM3D_SCENES[split]))):
+            scene_key = os.path.basename(scene).split(".")[0]
+            cfg = get_objnav_config(i, scene_key)
+            sim = get_simulator(cfg)
+            objects_info = sim.semantic_scene.objects
+            pose_sampler = PoseSampler(
+                sim=sim,
+                r_min=0.5,
+                r_max=2.0,
+                r_step=0.5,
+                rot_deg_delta=10.0,
+                h_min=0.8,
+                h_max=1.4,
+                sample_lookat_deg_delta=5.0,
+            )
+            print(f"Starting scene: {scene_key}")
+            get_objects(sim, objects_info, scene_key, object_map, pose_sampler)
+            sim.close()
 
-    sorted_object_mapping = {}
-    print(f"Total number of objects visualized is {len(object_map.keys())}")
-    for obj in object_map.keys():
-        sorted_object_mapping[obj] = []
-        for scene, (cov, fraction) in object_map[obj].items():
-            sorted_object_mapping[obj].append((cov, fraction, scene))
-        sorted_object_mapping[obj] = sorted(sorted_object_mapping[obj], reverse=True)
-    with open(f"data/object_images_{split}.pickle", "wb") as handle:
-        pickle.dump(sorted_object_mapping, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        sorted_object_mapping = {}
+        print(f"Total number of objects visualized is {len(object_map.keys())}")
+        for obj in object_map.keys():
+            sorted_object_mapping[obj] = []
+            for scene, (cov, fraction) in object_map[obj].items():
+                sorted_object_mapping[obj].append((cov, fraction, scene))
+            sorted_object_mapping[obj] = sorted(
+                sorted_object_mapping[obj], reverse=True
+            )
+        with open(f"data/object_images_{split}.pickle", "wb") as handle:
+            pickle.dump(sorted_object_mapping, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    with open(f"data/object_images_{split}.pickle", "rb") as input_file:
+        sorted_object_mapping = pickle.load(input_file)
 
     for threshold in [0.025, 0.05, 0.1, 0.15, 0.20]:
         for vis in [True, False]:
