@@ -13,10 +13,8 @@ from habitat_sim.simulator import Simulator
 from ovon.dataset.pose_sampler import PoseSampler
 from ovon.dataset.semantic_utils import get_hm3d_semantic_scenes
 from ovon.dataset.visualise_objects import get_objnav_config, get_simulator
-from ovon.dataset.visualization import (
-    get_best_viewpoint_with_posesampler,
-    get_bounding_box,
-)
+from ovon.dataset.visualization import (get_best_viewpoint_with_posesampler,
+                                        get_bounding_box)
 from scipy.spatial import distance
 from torchvision.transforms import ToPILImage
 from tqdm import tqdm
@@ -50,51 +48,52 @@ def create_html(
         }
     </style>
     """
+    html_script = """
+    <script>
+    var li_relationships = []
+    function addRelationships(cb) {
+    if (cb.checked) {
+        li_relationships.push(cb.id);
+    }
+    else {
+        var index = li_relationships.indexOf(cb.id);
+        if (index > -1) {
+            li_relationships.splice(index, 1);
+        }
+    }
+    localStorage.setItem("relationships",li_relationships)
+    }
+    </script>
+    """
     cnt = 0
     html_body = ""
     for scene in relationships.keys():
         for info_dict in relationships[scene]:
             if visualised and np.sum(info_dict["area"]) >= threshold:
                 cnt += 1
-                name = info_dict["img_ref"]
+
+                name = info_dict["name"]
+                img_ref = info_dict["img_ref"]
                 cov_sum = np.sum(info_dict["cov"])
                 area = np.sum(info_dict["area"])
-                html_body += f"""<input type="checkbox" id="{scene}/{name}" name="{scene}/{name}">"""
+
                 if cnt % 5 == 1:
                     html_body += """<div class="row">"""
                 html_body += f"""
+                            <input type="checkbox" id="{scene}_{img_ref}" name="{scene}_{name} onclick="addRelationships(this);"">
                             <div class="column">
-                                <img src="../images/relationships_{dim}d/{scene}/{info_dict['img_ref']}.png" alt="{info_dict['img_ref']}" style="width:100%">
-                                <h5>{info_dict['img_ref']} cov = {cov_sum:.3f}, frac = {area:.3f}, dist = {info_dict['distance']:.3f}</h5>
+                                <img src="../images/relationships_{dim}d/{scene}/{img_ref}.png" alt="{img_ref}" style="width:100%">
+                                <h5>{img_ref} cov = {cov_sum:.3f}, frac = {area:.3f}, dist = {info_dict['distance']:.3f}</h5>
                             </div>
                             """
                 if cnt % 5 == 0:
                     html_body += "</div>"
-            # Filtered Objects
-            elif not visualised and info_dict["area"] < threshold:
-                cnt += 1
-                if cnt % 5 == 1:
-                    html_body += """<div class="row">"""
-                html_body += f"""
-                            <div class="column">
-                                <input type="checkbox" id="{name}" name="{name}">
-                                <img src="../images/relationships_{dim}d/{scene}/{info_dict['img_ref']}.png" alt="{name}" style="width:100%">
-                                <h5>cov = {sum(info_dict['cov']):.3f}, frac = {info_dict['area']:.3f}</h5>
-                            </div>
-                            """
-                if cnt % 5 == 0:
-                    html_body += "</div>"
-    html_body = (
-        f"""
+    html_body = f"""
                 <body>
                 <h2> Visualising {cnt} Relationships </h2>
-                """
-        + html_body
-    )
-    html_body += """</body>
-                    </html>"""
+                """ + html_body + """</body></html>"""
     f = open(file_name, "w")
-    f.write(html_head + html_style + html_body)
+    f.write(html_head + html_style + html_script + html_body)
     f.close()
 
 
@@ -107,6 +106,14 @@ def is_above(b: SemanticObject, a: SemanticObject, eps=0.05) -> bool:
     if b_center[1] - b_y + eps > a_center[1] + a_y:
         return True
     return False
+
+
+def find_relation_above(pt1: np.ndarray, pt2: np.ndarray) -> bool:
+    disp = pt1 - pt2
+    disp_y = disp[1]
+    disp[1] = 0
+    if np.linalg.norm(disp) < disp_y:
+        return True
 
 
 def get_relation_3d(
@@ -198,28 +205,34 @@ def get_relation_2d(
     return False, None, None, None, None
 
 
-def get_surface_points(obj_a: SemanticObject) -> np.ndarray:
-    xmin, ymin, zmin = obj_a.aabb.center - obj_a.aabb.sizes / 2
-    xmax, ymax, zmax = obj_a.aabb.center + obj_a.aabb.sizes / 2
-
-    x_coords = np.linspace(xmin, xmax, num=100)
-    y_coords = np.linspace(ymin, ymax, num=100)
-    z_coords = np.linspace(zmin, zmax, num=100)
-
-    points_minx = np.array([(xmin, y, z) for y, z in zip(y_coords, z_coords)])
-    points_maxx = np.array([(xmax, y, z) for y, z in zip(y_coords, z_coords)])
-    points_miny = np.array([(x, ymin, z) for x, z in zip(x_coords, z_coords)])
-    points_maxy = np.array([(x, ymax, z) for x, z in zip(x_coords, z_coords)])
-    points_minz = np.array([(x, y, zmin) for x, y in zip(x_coords, y_coords)])
-    points_maxz = np.array([(x, y, zmax) for x, y in zip(x_coords, y_coords)])
-
-    points = np.concatenate(
-        (points_minx, points_maxx, points_miny, points_maxy, points_minz, points_maxz)
-    )
-    return points
-
-
 def is_close_to(obj_a: SemanticObject, obj_b: SemanticObject, delta: float) -> Tuple:
+    def get_surface_points(obj_a: SemanticObject) -> np.ndarray:
+        xmin, ymin, zmin = obj_a.aabb.center - obj_a.aabb.sizes / 2
+        xmax, ymax, zmax = obj_a.aabb.center + obj_a.aabb.sizes / 2
+
+        x_coords = np.linspace(xmin, xmax, num=100)
+        y_coords = np.linspace(ymin, ymax, num=100)
+        z_coords = np.linspace(zmin, zmax, num=100)
+
+        points_minx = np.array([(xmin, y, z) for y, z in zip(y_coords, z_coords)])
+        points_maxx = np.array([(xmax, y, z) for y, z in zip(y_coords, z_coords)])
+        points_miny = np.array([(x, ymin, z) for x, z in zip(x_coords, z_coords)])
+        points_maxy = np.array([(x, ymax, z) for x, z in zip(x_coords, z_coords)])
+        points_minz = np.array([(x, y, zmin) for x, y in zip(x_coords, y_coords)])
+        points_maxz = np.array([(x, y, zmax) for x, y in zip(x_coords, y_coords)])
+
+        points = np.concatenate(
+            (
+                points_minx,
+                points_maxx,
+                points_miny,
+                points_maxy,
+                points_minz,
+                points_maxz,
+            )
+        )
+        return points
+
     pts_a = get_surface_points(obj_a)
     pts_b = get_surface_points(obj_b)
     dist = distance.cdist(pts_a, pts_b, "euclidean")

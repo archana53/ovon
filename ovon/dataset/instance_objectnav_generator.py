@@ -431,7 +431,6 @@ class InstanceObjectGoalGenerator:
         id_to_object = {obj.semantic_id: obj for obj in objects}
 
         scene_key = os.path.basename(scene).split(".")[0]
-        print(scene_key, self.relationships_mapping)
         scene_relationships = self.relationships_mapping[scene_key]
 
         object_goals = defaultdict(list)
@@ -634,7 +633,7 @@ def make_episodes_for_scene(args):
         mapping_file="ovon/dataset/source_data/Mp3d_category_mapping.tsv",
         categories=None,
         coverage_meta_file="data/object_images_train.pickle",
-        relationship_meta_file="data/relationships3d_train_corrected.pickle",
+        relationship_meta_file="data/relationships/relationships2d_train_1_filtered.pickle",
         frame_cov_thresh=0.05,
         goal_vp_cell_size=0.1,
         goal_vp_max_dist=1.0,
