@@ -74,6 +74,7 @@ class InstanceObjectGoalGenerator:
         sample_dense_viewpoints: bool = False,
         device_id: int = 0,
         total_tasks: int = 0,
+        max_viewpoint_radius: float = 1.0,
     ) -> None:
         self.semantic_spec_filepath = semantic_spec_filepath
         self.img_size = img_size
@@ -99,6 +100,7 @@ class InstanceObjectGoalGenerator:
             frame_coverage_threshold=frame_cov_thresh,
         )
         self.relationships_mapping = SceneRelationshipsMapping(relationship_meta_file)
+        self.max_viewpoint_radius = max_viewpoint_radius
 
     def _config_sim(self, scene: str) -> Simulator:
         sim_cfg = hsim.SimulatorConfiguration()
@@ -431,17 +433,18 @@ class InstanceObjectGoalGenerator:
         id_to_object = {obj.semantic_id: obj for obj in objects}
 
         scene_key = os.path.basename(scene).split(".")[0]
+        print(scene_key)
         scene_relationships = self.relationships_mapping[scene_key]
 
         object_goals = defaultdict(list)
         results = []
 
-        for reln_name, reln_list in tqdm(
+        for reln_name, reln_instances_list in tqdm(
             scene_relationships.items(),
             total=len(scene_relationships.items()),
             dynamic_ncols=True,
         ):
-            for instance in reln_list:
+            for instance in reln_instances_list:
                 obj_id = instance["target_obj_semantic_id"]
                 obj = id_to_object[obj_id]
                 goal = self._make_goal(
@@ -452,7 +455,7 @@ class InstanceObjectGoalGenerator:
                     with_start_poses,
                     prompt_goal=reln_name,
                 )
-                if goal is not None:
+                if goal is not None and len(goal["view_points"]) > 0:
                     object_goals[reln_name].append(goal)
                     results.append((obj_id, reln_name, len(goal["view_points"])))
 
@@ -561,7 +564,7 @@ class InstanceObjectGoalGenerator:
         )
 
     def make_episodes(self, object_goals, scene):
-        dataset = habitat.datasets.make_dataset("InstanceObjectNav-v1")
+        dataset = habitat.datasets.make_dataset("ObjectNav-v1")
         dataset.category_to_task_category_id = {}
         dataset.category_to_scene_annotation_category_id = {}
 
@@ -632,7 +635,7 @@ def make_episodes_for_scene(args):
         },
         mapping_file="ovon/dataset/source_data/Mp3d_category_mapping.tsv",
         categories=None,
-        coverage_meta_file="data/object_images_train.pickle",
+        coverage_meta_file="data/coverage_meta/train.pkl",
         relationship_meta_file="data/relationships/relationships2d_train_1_filtered.pickle",
         frame_cov_thresh=0.05,
         goal_vp_cell_size=0.1,
@@ -666,9 +669,10 @@ def make_episodes_for_split(
     multiprocessing_enabled: bool = False,
 ):
     """Makes episodes for all scenes in a split"""
-    scenes = list(get_hm3d_semantic_scenes("data/scene_datasets/hm3d", [split])[split])[
-        :num_scenes
-    ]
+    scenes = sorted(
+        list(get_hm3d_semantic_scenes("data/scene_datasets/hm3d", [split])[split]),
+        reverse=True,
+    )[:num_scenes]
     print(scenes)
 
     dataset = habitat.datasets.make_dataset("ObjectNav-v1")

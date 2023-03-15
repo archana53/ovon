@@ -154,9 +154,7 @@ class SceneRelationshipsMapping(MutableMapping):
         new_mapping = {}
         for scene in mapping.keys():
             new_mapping[scene] = {
-                reln["img_ref"]: [
-                    i for i in mapping[scene] if i["img_ref"] == reln["img_ref"]
-                ]
+                reln["name"]: [i for i in mapping[scene] if i["name"] == reln["name"]]
                 for reln in mapping[scene]
             }
 
